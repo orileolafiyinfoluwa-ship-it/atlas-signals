@@ -21,92 +21,78 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "AtlasSignals/1.0"})
 
 
-def get_candles(symbol, interval, target=250):
+def get_candles(symbol, interval, limit=250):
+    from datetime import datetime, timedelta, timezone
+
     url = f"{API_URL}/{symbol}/ohlc"
-    end_time = datetime.now(timezone.utc)
-    frames = []
 
-    # Search farther back in time, using separate date windows.
-    for _ in range(30):
-        start_time = end_time - timedelta(days=7)
+    now = datetime.now(timezone.utc)
+    chunk_days = 7 if interval == "1h" else 2
+    collected = []
 
-        params = {
-            "interval": interval,
-            "limit": 1000,
-            "from": start_time.isoformat(),
-            "to": end_time.isoformat(),
-        }
+    for step in range(30):
+        end_time = now - timedelta(days=step * chunk_days)
+        start_time = end_time - timedelta(days=chunk_days)
 
-        response = SESSION.get(
+        response = requests.get(
             url,
-            params=params,
-            timeout=25,
+            params={
+                "interval": interval,
+                "limit": 1000,
+                "from": start_time.isoformat(),
+                "to": end_time.isoformat(),
+            },
+            timeout=20,
         )
         response.raise_for_status()
 
         payload = response.json()
 
         if not isinstance(payload, dict):
-            raise ValueError("Unexpected candle API response.")
+            raise ValueError("Unexpected API response.")
 
         bars = payload.get("bars", [])
 
-        if bars:
-            frames.append(pd.DataFrame(bars))
+        if not isinstance(bars, list):
+            raise ValueError("Invalid candle data.")
 
-        if frames:
-            combined = pd.concat(frames, ignore_index=True)
+        collected.extend(bars)
 
-            if "openTime" not in combined.columns:
-                raise ValueError("Missing candle timestamps.")
+        if len(collected) >= limit + 1:
+            break
 
-            combined = combined.drop_duplicates(
-                subset=["openTime"]
-            )
+    if not collected:
+        raise ValueError("No candle data available.")
 
-            if len(combined) >= target + 50:
-                break
-
-        end_time = start_time
-
-    if not frames:
-        raise ValueError("No historical candles returned.")
-
-    df = pd.concat(frames, ignore_index=True)
+    df = pd.DataFrame(collected)
 
     required = ["openTime", "open", "high", "low", "close"]
 
-    if not all(col in df.columns for col in required):
+    if not all(column in df.columns for column in required):
         raise ValueError("Candle data is missing required fields.")
 
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for column in ["open", "high", "low", "close"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    df = df.dropna(
-        subset=["open", "high", "low", "close"]
-    )
+    df = df.dropna(subset=["open", "high", "low", "close"])
 
     if "isOpen" in df.columns:
-        open_flags = (
-            df["isOpen"]
-            .astype(str)
-            .str.lower()
-            .isin(["true", "1"])
+        df = df[
+            ~df["isOpen"].astype(str).str.lower().isin(
+                ["true", "1"]
+            )
+        ]
+
+    df = df.drop_duplicates(subset=["openTime"])
+    df = df.sort_values("openTime").reset_index(drop=True)
+
+    if len(df) < limit:
+        raise ValueError(
+            f"Only {len(df)} completed candles available; "
+            f"{limit} required."
         )
-        df = df[~open_flags]
 
-    df = df.drop_duplicates(
-        subset=["openTime"]
-    )
-
-    df = df.sort_values(
-        "openTime"
-    ).reset_index(drop=True)
-
-    if df.empty:
-        raise ValueError("No completed candles available.")
-
-    return df
+    return df.tail(limit).reset_index(drop=True)
 
 
 def analyse(symbol):
