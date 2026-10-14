@@ -2,6 +2,7 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
 import pandas as pd
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 CORS(app)
@@ -17,47 +18,67 @@ MARKETS = {
 }
 
 
-def get_candles(symbol, interval, limit=250):
+def get_candles(symbol, interval, target=250):
     url = f"{API_URL}/{symbol}/ohlc"
+    now = datetime.now(timezone.utc)
+    end_time = now
+    frames = []
 
-    response = requests.get(
-        url,
-        params={"interval": interval, "limit": limit},
-        timeout=20,
-    )
-    response.raise_for_status()
+    # Collect candles from successive historical windows.
+    window_days = 7
 
-    payload = response.json()
+    for _ in range(8):
+        start_time = end_time - timedelta(days=window_days)
 
-    if not isinstance(payload, dict):
-        raise ValueError("Unexpected API response.")
+        params = {
+            "interval": interval,
+            "limit": 1000,
+            "from": start_time.isoformat(),
+            "to": end_time.isoformat(),
+        }
 
-    bars = payload.get("bars")
+        response = requests.get(
+            url, params=params, timeout=20
+        )
+        response.raise_for_status()
 
-    if not isinstance(bars, list) or not bars:
-        raise ValueError("No candle data available.")
+        payload = response.json()
+        bars = payload.get("bars", []) if isinstance(payload, dict) else []
 
-    df = pd.DataFrame(bars)
+        if bars:
+            frames.append(pd.DataFrame(bars))
+
+        # Stop once we have enough raw candles to analyse.
+        if frames:
+            combined = pd.concat(frames, ignore_index=True)
+            if len(combined) >= target + 20:
+                break
+
+        end_time = start_time
+
+    if not frames:
+        raise ValueError("No historical candles returned.")
+
+    df = pd.concat(frames, ignore_index=True)
 
     required = ["openTime", "open", "high", "low", "close"]
 
-    if not all(column in df.columns for column in required):
+    if not all(col in df.columns for col in required):
         raise ValueError("Candle data is missing required fields.")
 
-    for column in ["open", "high", "low", "close"]:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna(subset=["open", "high", "low", "close"])
 
-    # Exclude unfinished candles.
     if "isOpen" in df.columns:
-        df = df[
-            ~df["isOpen"].astype(str).str.lower().isin(
-                ["true", "1"]
-            )
-        ]
+        open_flags = (
+            df["isOpen"].astype(str).str.lower()
+            .isin(["true", "1"])
+        )
+        df = df[~open_flags]
 
-    # Biquote returns the newest candles first.
+    df = df.drop_duplicates(subset=["openTime"])
     df = df.sort_values("openTime").reset_index(drop=True)
 
     if df.empty:
@@ -75,10 +96,12 @@ def analyse(symbol):
             "market": MARKETS[symbol],
             "symbol": symbol,
             "signal": "WAIT",
-            "reason": "Not enough completed candles.",
+            "reason": (
+                f"Not enough completed candles. "
+                f"H1: {len(hourly)}, M15: {len(fifteen)}."
+            ),
         }
 
-    # H1 trend filter.
     hourly["ema50"] = hourly["close"].ewm(
         span=50, adjust=False
     ).mean()
@@ -88,8 +111,6 @@ def analyse(symbol):
     ).mean()
 
     trend = hourly.iloc[-1]
-
-    # M15 setup.
     previous = fifteen.iloc[-2]
     last = fifteen.iloc[-1]
     recent = fifteen.iloc[-12:-1]
@@ -127,9 +148,7 @@ def analyse(symbol):
 
     if bullish_trend and bullish_sweep:
         entry = float(last["close"])
-        stop_loss = float(
-            min(fifteen.iloc[-5:]["low"].min(), last["low"])
-        )
+        stop_loss = float(fifteen.iloc[-5:]["low"].min())
         risk = entry - stop_loss
 
         if risk > 0:
@@ -143,9 +162,7 @@ def analyse(symbol):
 
     elif bearish_trend and bearish_sweep:
         entry = float(last["close"])
-        stop_loss = float(
-            max(fifteen.iloc[-5:]["high"].max(), last["high"])
-        )
+        stop_loss = float(fifteen.iloc[-5:]["high"].max())
         risk = stop_loss - entry
 
         if risk > 0:
@@ -182,10 +199,7 @@ def all_signals():
         try:
             results[symbol] = analyse(symbol)
         except Exception:
-            app.logger.exception(
-                "Signal calculation failed for %s", symbol
-            )
-
+            app.logger.exception("Analysis failed for %s", symbol)
             results[symbol] = {
                 "market": MARKETS[symbol],
                 "symbol": symbol,
@@ -209,10 +223,7 @@ def one_signal(symbol):
     try:
         return jsonify(analyse(symbol))
     except Exception:
-        app.logger.exception(
-            "Signal calculation failed for %s", symbol
-        )
-
+        app.logger.exception("Analysis failed for %s", symbol)
         return jsonify({
             "market": MARKETS[symbol],
             "symbol": symbol,
@@ -222,7 +233,4 @@ def one_signal(symbol):
 
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=10000,
-      )
+    app.run(host="0.0.0.0", port=10000)
