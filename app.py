@@ -17,18 +17,18 @@ MARKETS = {
     "EURUSD": "EURUSD",
 }
 
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "AtlasSignals/1.0"})
+
 
 def get_candles(symbol, interval, target=250):
     url = f"{API_URL}/{symbol}/ohlc"
-    now = datetime.now(timezone.utc)
-    end_time = now
+    end_time = datetime.now(timezone.utc)
     frames = []
 
-    # Collect candles from successive historical windows.
-    window_days = 7
-
-    for _ in range(8):
-        start_time = end_time - timedelta(days=window_days)
+    # Search farther back in time, using separate date windows.
+    for _ in range(30):
+        start_time = end_time - timedelta(days=7)
 
         params = {
             "interval": interval,
@@ -37,21 +37,34 @@ def get_candles(symbol, interval, target=250):
             "to": end_time.isoformat(),
         }
 
-        response = requests.get(
-            url, params=params, timeout=20
+        response = SESSION.get(
+            url,
+            params=params,
+            timeout=25,
         )
         response.raise_for_status()
 
         payload = response.json()
-        bars = payload.get("bars", []) if isinstance(payload, dict) else []
+
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected candle API response.")
+
+        bars = payload.get("bars", [])
 
         if bars:
             frames.append(pd.DataFrame(bars))
 
-        # Stop once we have enough raw candles to analyse.
         if frames:
             combined = pd.concat(frames, ignore_index=True)
-            if len(combined) >= target + 20:
+
+            if "openTime" not in combined.columns:
+                raise ValueError("Missing candle timestamps.")
+
+            combined = combined.drop_duplicates(
+                subset=["openTime"]
+            )
+
+            if len(combined) >= target + 50:
                 break
 
         end_time = start_time
@@ -69,17 +82,26 @@ def get_candles(symbol, interval, target=250):
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=["open", "high", "low", "close"])
+    df = df.dropna(
+        subset=["open", "high", "low", "close"]
+    )
 
     if "isOpen" in df.columns:
         open_flags = (
-            df["isOpen"].astype(str).str.lower()
+            df["isOpen"]
+            .astype(str)
+            .str.lower()
             .isin(["true", "1"])
         )
         df = df[~open_flags]
 
-    df = df.drop_duplicates(subset=["openTime"])
-    df = df.sort_values("openTime").reset_index(drop=True)
+    df = df.drop_duplicates(
+        subset=["openTime"]
+    )
+
+    df = df.sort_values(
+        "openTime"
+    ).reset_index(drop=True)
 
     if df.empty:
         raise ValueError("No completed candles available.")
@@ -88,29 +110,41 @@ def get_candles(symbol, interval, target=250):
 
 
 def analyse(symbol):
-    hourly = get_candles(symbol, "1h", 250)
-    fifteen = get_candles(symbol, "15m", 100)
+    hourly = get_candles(symbol, "1h", 300)
+    fifteen = get_candles(symbol, "15m", 150)
+
+    counts = {
+        "H1": len(hourly),
+        "M15": len(fifteen),
+    }
 
     if len(hourly) < 200 or len(fifteen) < 15:
         return {
             "market": MARKETS[symbol],
             "symbol": symbol,
             "signal": "WAIT",
-            "reason": (
-                f"Not enough completed candles. "
-                f"H1: {len(hourly)}, M15: {len(fifteen)}."
-            ),
+            "reason": "Not enough completed candles.",
+            "candles_available": counts,
+            "candles_required": {
+                "H1": 200,
+                "M15": 15,
+            },
         }
 
+    # Higher-timeframe trend filter.
     hourly["ema50"] = hourly["close"].ewm(
-        span=50, adjust=False
+        span=50,
+        adjust=False,
     ).mean()
 
     hourly["ema200"] = hourly["close"].ewm(
-        span=200, adjust=False
+        span=200,
+        adjust=False,
     ).mean()
 
     trend = hourly.iloc[-1]
+
+    # Lower-timeframe sweep confirmation.
     previous = fifteen.iloc[-2]
     last = fifteen.iloc[-1]
     recent = fifteen.iloc[-12:-1]
@@ -143,12 +177,15 @@ def analyse(symbol):
         "risk_reward": "1:2",
         "strategy": "H1 EMA 50/200 + M15 sweep",
         "reason": "No confirmed setup. Wait.",
+        "candles_available": counts,
         "candle_time": str(last["openTime"]),
     }
 
     if bullish_trend and bullish_sweep:
         entry = float(last["close"])
-        stop_loss = float(fifteen.iloc[-5:]["low"].min())
+        stop_loss = float(
+            fifteen.iloc[-5:]["low"].min()
+        )
         risk = entry - stop_loss
 
         if risk > 0:
@@ -157,12 +194,16 @@ def analyse(symbol):
                 "entry": entry,
                 "stop_loss": stop_loss,
                 "take_profit": entry + 2 * risk,
-                "reason": "Bullish trend and sweep conditions met.",
+                "reason": (
+                    "Bullish trend and sweep conditions met."
+                ),
             })
 
     elif bearish_trend and bearish_sweep:
         entry = float(last["close"])
-        stop_loss = float(fifteen.iloc[-5:]["high"].max())
+        stop_loss = float(
+            fifteen.iloc[-5:]["high"].max()
+        )
         risk = stop_loss - entry
 
         if risk > 0:
@@ -171,7 +212,9 @@ def analyse(symbol):
                 "entry": entry,
                 "stop_loss": stop_loss,
                 "take_profit": entry - 2 * risk,
-                "reason": "Bearish trend and sweep conditions met.",
+                "reason": (
+                    "Bearish trend and sweep conditions met."
+                ),
             })
 
     return result
@@ -199,12 +242,18 @@ def all_signals():
         try:
             results[symbol] = analyse(symbol)
         except Exception:
-            app.logger.exception("Analysis failed for %s", symbol)
+            app.logger.exception(
+                "Analysis failed for %s",
+                symbol,
+            )
+
             results[symbol] = {
                 "market": MARKETS[symbol],
                 "symbol": symbol,
                 "signal": "UNAVAILABLE",
-                "reason": "Market data or analysis is temporarily unavailable.",
+                "reason": (
+                    "Market data or analysis is unavailable."
+                ),
             }
 
     return jsonify(results)
@@ -223,14 +272,23 @@ def one_signal(symbol):
     try:
         return jsonify(analyse(symbol))
     except Exception:
-        app.logger.exception("Analysis failed for %s", symbol)
+        app.logger.exception(
+            "Analysis failed for %s",
+            symbol,
+        )
+
         return jsonify({
             "market": MARKETS[symbol],
             "symbol": symbol,
             "signal": "UNAVAILABLE",
-            "reason": "Market data or analysis is temporarily unavailable.",
+            "reason": (
+                "Market data or analysis is unavailable."
+            ),
         }), 502
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(
+        host="0.0.0.0",
+        port=10000,
+                )
